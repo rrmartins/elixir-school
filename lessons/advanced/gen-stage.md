@@ -89,6 +89,7 @@ defmodule GenstageExample.Producer do
   end
 end
 ```
+[working commit](https://github.com/ybur-yug/genstage_example/commit/57418160a1e5cbb408e32184d913a12e207166f8)
 
 Let's break this down line by line.
 To begin with, we have our initial declarations:
@@ -169,6 +170,7 @@ defmodule GenstageExample.Consumer do
   end
 end
 ```
+[working commit](https://github.com/ybur-yug/genstage_example/commit/472a136229e5926294babe10a5bab307ed7c1f54)
 
 To start, let's look at the beginning functions just like last time:
 
@@ -265,6 +267,7 @@ Let's make some adjustments so that we can have multiple workers by modifying `l
     ]
 . . .
 ```
+[working commit](https://github.com/ybur-yug/genstage_example/commit/eb2e3a66254c9af053150996f4e9657363624b04)
 
 Now, let's fire up IEx again:
 
@@ -294,6 +297,7 @@ But we can take this even further:
     Supervisor.start_link(children ++ consumers, opts)
 . . .
 ```
+[working commit](https://github.com/ybur-yug/genstage_example/commit/981ace6631fb7c8a83f0e482d6d2a21b01f48612)
 
 What we are doing here is quite simple.
 First, we get the number of core on the machine with `System.schedulers_online/0`, and from there we simply create a worker just like we had.
@@ -333,6 +337,7 @@ We can take this a step further and change our broadcasting strategy from the de
   end
 . . .
 ```
+[working commit](https://github.com/ybur-yug/genstage_example/commit/87c5f96c74e8fa90cd5b5fd108cd9ba104f78a65)
 
 What this does is it accumulates demand from all consumers before broadcasting its events to all of them.
 If we fire up IEx we can see the implication:
@@ -359,3 +364,5 @@ Note that some numbers are showing twice now, this is why.
 ## What's Next?
 In the next GenStage lessons we will take this code and go beyond simply getting the basis set up.
 We will dive into the actual technical details of GenStage, and eventually build up a simple clone of DelayedJob in around 100 lines of code.
+[Here](https://github.com/ybur-yug/genstage_example/tree/87c5f96c74e8fa90cd5b5fd108cd9ba104f78a65) is a link to all code thus far.
+
