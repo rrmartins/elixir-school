@@ -361,6 +361,83 @@ If we fire up IEx we can see the implication:
 
 Note that some numbers are showing twice now, this is why.
 
+
+## Setting Up Postgres to Extend Our Model
+To go further we'll need to bring in a database to store our progress and status.
+This is quite simple using [Ecto](LINKTOLESSON).
+To get started let's add it and the Postgresql adapter to `mix.exs`:
+
+```elixir
+. . .
+  defp deps do
+    [
+     {:gen_stage, "~> 0.7"},
+     {:ecto, "~> 2.0"},
+     {:postgrex, "~> 0.12.1"},
+    ]
+  end
+. . .
+
+```
+
+Fetch the dependencies and compile:
+
+```shell
+$ mix do deps.get, compile
+```
+
+And now we can add a repo for setup in `lib/repo.ex`:
+
+```elixir
+defmodule GenstageExample.Repo do
+  use Ecto.Repo,
+    otp_app: :genstage_example
+end
+```
+
+and with this we can set up our config next in `config/config.exs`:
+
+```elixir
+use Mix.Config
+
+config :genstage_example, ecto_repos: [GenstageExample.Repo]
+
+config :genstage_example, GenstageExample.Repo,
+  adapter: Ecto.Adapters.Postgres,
+  database: "genstage_example",
+  username: "your_username",
+  password: "your_password",
+  hostname: "localhost",
+  port: "5432"
+```
+
+And if we add a supservisor to `lib/genstage_example.ex` we can now start working with the DB:
+
+```elixir
+. . .
+  def start(_type, _args) do
+    import Supervisor.Spec, warn: false
+
+    children = [
+      supervisor(GenstageExample.Repo, []),
+      worker(GenstageExample.Producer, []),
+    ]
+  end
+. . .
+```
+
+Now we need to create our migration:
+
+```shell
+$ mix ecto.gen.migration setup_tasks status:text payload:binary
+```
+
+# still goin...
+
+```elixir
+
+```
+
 ## What's Next?
 In the next GenStage lessons we will take this code and go beyond simply getting the basis set up.
 We will dive into the actual technical details of GenStage, and eventually build up a simple clone of DelayedJob in around 100 lines of code.
