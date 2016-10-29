@@ -19,7 +19,7 @@ What it means is that GenStage provides a way for us to define a pipeline of wor
 We could go into the technical and theoretical implications of this, but instead lets try a pragmatic approach to really just get it to work.
 
 First, Let's imagine we have a server that constantly emits numbers.
-It starts at the state of the number we give it, then counts up in one from htere onward.
+It starts at the state of the number we give it, then counts up in one from there onward.
 This is what we would call our producer.
 Each time it emits a number, this is an event, and we want to handle it with a consumer.
 A consumer simply takes what a producer emits and does something to it.
