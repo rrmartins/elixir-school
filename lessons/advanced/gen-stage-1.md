@@ -442,7 +442,7 @@ $ mix ecto.gen.migration setup_tasks status:text payload:binary
 ```
 
 Now that we have a functional database, we can start storing things.
-First, let's remove our change in Broadcaster, we only were doing that to demonstrate that there are others outside the normal default in our Producer.
+Let's remove our change in Broadcaster, as we only were doing that to demonstrate that there are others outside the normal default in our Producer.
 
 ```elixir
 . . .
@@ -452,175 +452,343 @@ First, let's remove our change in Broadcaster, we only were doing that to demons
 . . .
 ```
 
-Next, we'll alter our `handle_demand/2` to actually do something with our events:
+### Modelling the Rest of the Functionality
+
+Now that we have all this boilerplate work completed we should come up with a model to run all of this now that we have a simple wired-together producer/consumer model.
+At the end of the day we are trying to make a task runner.
+To do this, we probably want to abstract the interface for tasks and DB interfacing into their own modules.
+To start, let's create our `Task` module to model our actual tasks to be run:
 
 ```elixir
-. . .
-  def handle_demand(demand, state) do
-    limit = demand + state
-    {count, events} = take(limit)
-    {:noreply, events, limit - count}
+defmodule GenstageExample.Task do
+  def enqueue(status, payload) do
+    GenstageExample.TaskDBInterface.insert_tasks(status, payload)
   end
-. . .
+
+  def take(limit) do
+    GenstageExample.TaskDBInterface.take_tasks(limit)
+  end
+end
 ```
 
-With this, we are taking a few simple steps:
+This is a _really_ simple interface to abstract a given task's functionality.
+We only have 2 functions.
+Now, the module they are calling doesn't exist yet, it gives us the ideas we need to build a very simple interface. 
+These can be broken down as follows:
 
-1. We set a `limit` that is our current demand and the state of the demand combined.
-2. We use a (yet-to-be-defined) function `take/1` to get that many events
-3. We `noreply` with our events and the difference between our limit and the count of items in the DB
+1. `enqueue/2` - Enqueue a task to be run
+3. `take/1` - Take a given number of tasks to run from the database
 
-Now, let's create the functionality to outline this new way we handle demand by defining `take/1`:
-
-```elixir
-. . .
-  def take(demand) do
-    {:ok, {count, events}} =
-      GenstageExample.Repo.transaction fn ->
-        GenstageExample.Repo.update_all by_ids(task_ids(demand)),
-                                        [set: [status: "running"]],
-                                        [returning: [:id, :payload]]
-      end
-    {count, events}
-  end
-. . .
-```
-
-Now, here we call a few more things are arent defining yet but flesh out what our goal is.
-First we create a transaction in the database to wrap our operation.
-Next, we get a bunch of tasks and set their status to running, and return their payload and id.
-This gives us a count of items to-be-done and a bunch of events, and now we can later handle them properly.
-
-Now lets define the rest of these missing functions:
+Now this gives us the interface we need: we can set things to be run, and grab tasks to be run and we can define the rest of the interface.
+Let's create an interface with our database in its own module:
 
 ```elixir
-. . .
-  def task_ids demand do
-    demand
-    |> waiting
-    |> GenstageExample.Repo.all
-  end
-
-  def by_ids task_ids do
-    from t in "tasks", where: t.id in ^task_ids
-  end
-
-  def waiting demand do
-    from t in "tasks",
-      where: t.status == "waiting",
-      limit: ^demand,
-      select: t.id,
-      lock: "FOR UPDATE SKIP LOCKED"
-  end
-. . .
-```
-
-Let's start explaining this from the bottom up.
-First, we have a simple function to get all the tasks that currently have their status set to waiting, that is limited to our total amount of demand.
-We also set a database lock so that if something is already being accessed to just skip over it.
-With this method to grab the ids, we now make a function to do something based off of where they are selectable.
-
-So this is how our producer ought to look now:
-
-```elixir
-defmodule GenstageExample.Producer do
-  alias Experimental.GenStage
-  use GenStage
-
+defmodule GenstageExample.TaskDBInterface do
   import Ecto.Query
-  import GenstageExample.Repo
 
-  def start_link do
-    GenStage.start_link(__MODULE__, 0, name: __MODULE__)
-  end
-
-  def init(counter) do
-    {:producer, counter}
-  end
-
-  def handle_demand(demand, state) do
-    limit = demand + state
-    {count, events} = take(limit)
-    {:noreply, events, limit - count}
-  end
-
-  def take demand do
+  def take_tasks(limit) do
     {:ok, {count, events}} =
       GenstageExample.Repo.transaction fn ->
-        GenstageExample.Repo.update_all by_ids(task_ids(demand)),
-                                        [set: [status: "running"]],
-                                        [returning: [:id, :payload]]
+        ids = GenstageExample.Repo.all waiting(limit)
+        GenstageExample.Repo.update_all by_ids(ids), [set: [status: "running"]], [returning: [:id, :payload]]
       end
     {count, events}
   end
 
-  def task_ids demand do
-    demand
-    |> waiting
-    |> GenstageExample.Repo.all
+  def insert_tasks(status, payload) do
+    GenstageExample.Repo.insert_all "tasks", [
+      %{status: status, payload: payload}
+    ]
   end
 
-  def by_ids task_ids do
-    from t in "tasks", where: t.id in ^task_ids
+  def update_task_status(id, status) do
+    GenstageExample.Repo.update_all by_ids([id]), set: [status: status]
   end
 
-  def waiting demand do
+  defp by_ids(ids) do
+    from t in "tasks", where: t.id in ^ids
+  end
+
+  defp waiting(limit) do
     from t in "tasks",
       where: t.status == "waiting",
-      limit: ^demand,
+      limit: ^limit,
       select: t.id,
       lock: "FOR UPDATE SKIP LOCKED"
   end
 end
 ```
 
-## Setting Up the Consumer for Real Work
-Our consumer is where we do the work.
-Now that we have our producer storing tasks, we want to have the consumer handle this as well.
-To do this we will add a simple group of functions to our `lib/genstage_example.ex` file.
+This one is a bit more complex, but we'll break it down piece by piece.
+We have 3 main functions, and 2 private helpers:
+
+#### Main Functions
+1. `take_tasks/1`
+2. `insert_tasks/2`
+3. `update_task_status/2`
+
+With `take_tasks/1` we have the bulk of our logic.
+This function will be called to grab tasks we have queued to run them.
+Let's look at the code:
+
+```elixir
+. . .
+  def take_tasks(limit) do
+    {:ok, {count, events}} =
+      GenstageExample.Repo.transaction fn ->
+        ids = GenstageExample.Repo.all waiting(limit)
+        GenstageExample.Repo.update_all by_ids(ids), [set: [status: "running"]], [returning: [:id, :payload]]
+      end
+    {count, events}
+  end
+. . .
+```
+
+We do a few things here.
+First, we go in and we wrap everything in a transaction.
+This maintains state in the database so we avoid race conditions and other bad things.
+Inside here, we get the ids of all tasks waiting to be executed up to some limit, and set them to `running` as their status.
+We return the `count` of total tasks and the events to be run in the consumer.
+
+Next we have `insert_tasks/2`:
+
+```elixir
+. . .
+  def insert_tasks(status, payload) do
+    GenstageExample.Repo.insert_all "tasks", [
+      %{status: status, payload: payload}
+    ]
+  end
+. . .
+```
+
+This one is a bit more simple.
+We just insert a task to be run with a given payload binary.
+
+Finally, we have `update_task_status/2`, which is also quite simple:
+
+```elixir
+. . .
+  def update_task_status(id, status) do
+    GenstageExample.Repo.update_all by_ids([id]), set: [status: status]
+  end
+. . .
+```
+
+Here we simple update tasks to the status we want using a given id.
+
+#### Helpers
+Our helpers are all called primarily inside of `take_tasks/1`, but also used elsewhere in the main public API.
+
+```elixir
+. . .
+  defp by_ids(ids) do
+    from t in "tasks", where: t.id in ^ids
+  end
+
+  defp waiting(limit) do
+    from t in "tasks",
+      where: t.status == "waiting",
+      limit: ^limit,
+      select: t.id,
+      lock: "FOR UPDATE SKIP LOCKED"
+  end
+. . .
+```
+
+Neither of these has a ton of complexity.
+`by_ids/1` simply grabs all tasks that match in a given list of IDs.
+
+`waiting/1` finds all tasks that have the status waiting up to a given limit.
+However, there is one note to make on `waiting/1`.
+We leverage a lock on all tasks being updated so we skip those, a feature available in psql 9.5+.
+Outside of this, it is a very simple `SELECT` statement.
+
+Now that we have our DB interface defined as it is used in the primary API, we can move onto the producer, consumer, and last bits of configuration.
+
+### Producer, Consumer, and Final Configuration
+
+#### Final Config
+We will need to do a bit of configuration in `lib/genstage_example.ex` to clarify things as well as give us the final functionalities we will need to run jobs.
+This is what we will end up with:
+
+```elixir
+. . .
+  def start(_type, _args) do
+    import Supervisor.Spec, warn: false
+                          # 12 workers / system core
+    consumers = for id <- (0..System.schedulers_online * 12) do
+                  worker(GenstageExample.Consumer, [], id: id)
+                end
+    producers = [
+                 worker(Producer, []),
+                ]
+
+    supervisors = [
+                    supervisor(GenstageExample.Repo, []),
+                    supervisor(Task.Supervisor, [[name: GenstageExample.TaskSupervisor]]),
+                  ]
+    children = supervisors ++ producers ++ consumers
+
+    opts = [strategy: :one_for_one, name: GenstageExample.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+
+  def start_later(module, function, args) do
+    payload = {module, function, args} |> :erlang.term_to_binary
+    Repo.insert_all("tasks", [
+                              %{status: "waiting", payload: payload}
+                             ])
+    notify_producer
+  end
+
+  def notify_producer do
+    send(Producer, :data_inserted)
+  end
+
+  defdelegate enqueue(module, function, args), to: Producer
+. . .
+```
+
+Let's tackle this from the top down.
+First, `start/2`:
+
+```elixir
+. . .
+  def start(_type, _args) do
+    import Supervisor.Spec, warn: false
+                          # 12 workers / system core
+    consumers = for id <- (0..System.schedulers_online * 12) do
+                  worker(GenstageExample.Consumer, [], id: id)
+                end
+    producers = [
+                 worker(Producer, []),
+                ]
+
+    supervisors = [
+                    supervisor(GenstageExample.Repo, []),
+                    supervisor(Task.Supervisor, [[name: GenstageExample.TaskSupervisor]]),
+                  ]
+    children = supervisors ++ producers ++ consumers
+
+    opts = [strategy: :one_for_one, name: GenstageExample.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+. . .
+```
+First of all, you will notice we are now defining producers, consumers, and supervisors separately.
+I find this convention to work quite well to illustrate the intentions of various processes and trees we are starting here.
+In these 3 lists we set up 12 consumers / CPU core, set up a single producer, and then our supervisors for the Repo, as well as one new one.
+
+This new supervisor is run through `Task.Supervisor`, which is built into Elixir.
+We give it a name so it is easily referred to in our GenStage code, `GenstageExample.TaskSupervisor`.
+Now, we define our children as the concatenation of all these lists.
+
+Next, we have `start_later/3`:
 
 ```elixir
 . . .
   def start_later(module, function, args) do
     payload = {module, function, args} |> :erlang.term_to_binary
-    GenstageExample.Repo.insert_all("tasks", [
-                                     %{status: "waiting", payload: payload}
-                                    ])
+    Repo.insert_all("tasks", [
+                              %{status: "waiting", payload: payload}
+                             ])
     notify_producer
   end
+. . .
+```
+This function takes a module, a function, and an argument.
+It then encodes them as a binary using some built-in erlang magic.
+From here, we then insert the task as `waiting`, and we notify a producer that a task has been inserted to run.
 
+Now let's check out `notify_producer/0`:
+
+```elixir
+. . .
   def notify_producer do
-    send(GenstageExample.Producer, :data_inserted)
+    send(Producer, :data_inserted)
   end
 . . .
 ```
 
-Now that we are sending this notification upon inserting something in the DB by storing a task to run from invoking that function we want to have our producer handle that message:
+This method is quite simple.
+We send our producer a message, `:data_inserted`, simply so that it knows what we did.
+The message here is arbitrary, but I chose this atom to make the meaning clear.
 
-```elixir
-...
-  def handle_info(:data_inserted, state) do
-    limit = state
-    {count, events} = take(limit)
-    {:noreply, events, limit - count}
-  end
-...
+Last, but not least we do some simple delegation:
+
 ```
+. . .
+  defdelegate enqueue(module, functions, args), to : Producer
+. . .
+```
+This simply makes it so if we call `GenstageExample.enqueue(module, function, args)` that it will be delegated to the same method in our producer.
 
-With this, upon receiving this message we will react by simple updating the count of tasks to run.
-
-Now, we also want to make sure our producer is only active if there is in fact demand.
-To account for this we make a simple change with a guard clause:
+### Producer Setup
+Our producer doesn't need a ton of work.
+first, we'll alter our `handle_demand/2` to actually do something with our events:
 
 ```elixir
 . . .
   def handle_demand(demand, state) when demand > 0 do
+    serve_jobs(demand + state)
+  end
 . . .
 ```
 
-And now we will only handle a demand if there is actually work to be done.
+We haven't defined `serve_jobs/2` yet, but we'll get there.
+The concept is simple, when we get a demand and demand is > 0, we do some work to the tune of demand + the current state's number of jobs.
 
-## Finalizing the Implementation
+Now that we will be sending a message to the producer when we run `start_later/3`, we will want to respond to it with a `handle_info/2` call:
+
+```elixir
+. . .
+  def handle_info(:enqueued, state) do
+    {count, events} = GenstageExample.Task.take(state)
+    {:noreply, events, state - count}
+  end
+. . .
+```
+
+With this, we simply respond by taking the number of tasks we are told to get ready to run.
+
+Now let's define `serve_jobs/1`:
+
+```elixir
+. . .
+  def serve_jobs limit do
+    {count, events} = GenstageExample.Task.take(limit)
+    Process.send_after(@name, :enqueued, 60_000)
+    {:noreply, events, limit - count}
+  end
+. . .
+```
+
+Now, we are sending a process in one minute that to our producer telling it that it should respond to `:enqueued`.
+Note that we call the process module with `@name`, which we will need to add at the top as a module attribute:
+
+```elixir
+. . .
+  @name __MODULE__
+. . .
+```
+
+Let's define that last function now, too:
+
+```elixir
+. . .
+  def handle_cast(:enqueued, state) do
+    serve_jobs(state)
+  end
+. . .
+```
+
+This will simply serve jobs when we tell the producer they have `state` number of enqueued and to respond.
+
+## Setting Up the Consumer for Real Work
+Our consumer is where we do the work.
+Now that we have our producer storing tasks, we want to have the consumer handle this as well.
+There is a good bit of work to be done here tying into our work so far.
 
 [Here](https://github.com/ybur-yug/genstage_example/tree/87c5f96c74e8fa90cd5b5fd108cd9ba104f78a65) is a link to all code thus far.
 
