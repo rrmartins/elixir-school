@@ -362,7 +362,7 @@ If we fire up IEx we can see the implication:
 Note that some numbers are showing twice now, this is why.
 
 
-## Setting Up Postgres to Extend Our Model
+## Setting Up Postgres to Extend Our Producer 
 To go further we'll need to bring in a database to store our progress and status.
 This is quite simple using [Ecto](LINKTOLESSON).
 To get started let's add it and the Postgresql adapter to `mix.exs`:
@@ -426,20 +426,201 @@ And if we add a supservisor to `lib/genstage_example.ex` we can now start workin
 . . .
 ```
 
+But we should also make an interface to do that, so let's import our query interface and repo to the producer:
+
+```elixir
+. . .
+  import Ecto.Query
+  import GenstageExample.Repo
+. . .
+```
+
 Now we need to create our migration:
 
 ```shell
 $ mix ecto.gen.migration setup_tasks status:text payload:binary
 ```
 
-# still goin...
+Now that we have a functional database, we can start storing things.
+First, let's remove our change in Broadcaster, we only were doing that to demonstrate that there are others outside the normal default in our Producer.
 
 ```elixir
-
+. . .
+  def init(counter) do
+    {:producer, counter}
+  end
+. . .
 ```
 
-## What's Next?
-In the next GenStage lessons we will take this code and go beyond simply getting the basis set up.
-We will dive into the actual technical details of GenStage, and eventually build up a simple clone of DelayedJob in around 100 lines of code.
+Next, we'll alter our `handle_demand/2` to actually do something with our events:
+
+```elixir
+. . .
+  def handle_demand(demand, state) do
+    limit = demand + state
+    {count, events} = take(limit)
+    {:noreply, events, limit - count}
+  end
+. . .
+```
+
+With this, we are taking a few simple steps:
+
+1. We set a `limit` that is our current demand and the state of the demand combined.
+2. We use a (yet-to-be-defined) function `take/1` to get that many events
+3. We `noreply` with our events and the difference between our limit and the count of items in the DB
+
+Now, let's create the functionality to outline this new way we handle demand by defining `take/1`:
+
+```elixir
+. . .
+  def take(demand) do
+    {:ok, {count, events}} =
+      GenstageExample.Repo.transaction fn ->
+        GenstageExample.Repo.update_all by_ids(task_ids(demand)),
+                                        [set: [status: "running"]],
+                                        [returning: [:id, :payload]]
+      end
+    {count, events}
+  end
+. . .
+```
+
+Now, here we call a few more things are arent defining yet but flesh out what our goal is.
+First we create a transaction in the database to wrap our operation.
+Next, we get a bunch of tasks and set their status to running, and return their payload and id.
+This gives us a count of items to-be-done and a bunch of events, and now we can later handle them properly.
+
+Now lets define the rest of these missing functions:
+
+```elixir
+. . .
+  def task_ids demand do
+    demand
+    |> waiting
+    |> GenstageExample.Repo.all
+  end
+
+  def by_ids task_ids do
+    from t in "tasks", where: t.id in ^task_ids
+  end
+
+  def waiting demand do
+    from t in "tasks",
+      where: t.status == "waiting",
+      limit: ^demand,
+      select: t.id,
+      lock: "FOR UPDATE SKIP LOCKED"
+  end
+. . .
+```
+
+Let's start explaining this from the bottom up.
+First, we have a simple function to get all the tasks that currently have their status set to waiting, that is limited to our total amount of demand.
+We also set a database lock so that if something is already being accessed to just skip over it.
+With this method to grab the ids, we now make a function to do something based off of where they are selectable.
+
+So this is how our producer ought to look now:
+
+```elixir
+defmodule GenstageExample.Producer do
+  alias Experimental.GenStage
+  use GenStage
+
+  import Ecto.Query
+  import GenstageExample.Repo
+
+  def start_link do
+    GenStage.start_link(__MODULE__, 0, name: __MODULE__)
+  end
+
+  def init(counter) do
+    {:producer, counter}
+  end
+
+  def handle_demand(demand, state) do
+    limit = demand + state
+    {count, events} = take(limit)
+    {:noreply, events, limit - count}
+  end
+
+  def take demand do
+    {:ok, {count, events}} =
+      GenstageExample.Repo.transaction fn ->
+        GenstageExample.Repo.update_all by_ids(task_ids(demand)),
+                                        [set: [status: "running"]],
+                                        [returning: [:id, :payload]]
+      end
+    {count, events}
+  end
+
+  def task_ids demand do
+    demand
+    |> waiting
+    |> GenstageExample.Repo.all
+  end
+
+  def by_ids task_ids do
+    from t in "tasks", where: t.id in ^task_ids
+  end
+
+  def waiting demand do
+    from t in "tasks",
+      where: t.status == "waiting",
+      limit: ^demand,
+      select: t.id,
+      lock: "FOR UPDATE SKIP LOCKED"
+  end
+end
+```
+
+## Setting Up the Consumer for Real Work
+Our consumer is where we do the work.
+Now that we have our producer storing tasks, we want to have the consumer handle this as well.
+To do this we will add a simple group of functions to our `lib/genstage_example.ex` file.
+
+```elixir
+. . .
+  def start_later(module, function, args) do
+    payload = {module, function, args} |> :erlang.term_to_binary
+    GenstageExample.Repo.insert_all("tasks", [
+                                     %{status: "waiting", payload: payload}
+                                    ])
+    notify_producer
+  end
+
+  def notify_producer do
+    send(GenstageExample.Producer, :data_inserted)
+  end
+. . .
+```
+
+Now that we are sending this notification upon inserting something in the DB by storing a task to run from invoking that function we want to have our producer handle that message:
+
+```elixir
+...
+  def handle_info(:data_inserted, state) do
+    limit = state
+    {count, events} = take(limit)
+    {:noreply, events, limit - count}
+  end
+...
+```
+
+With this, upon receiving this message we will react by simple updating the count of tasks to run.
+
+Now, we also want to make sure our producer is only active if there is in fact demand.
+To account for this we make a simple change with a guard clause:
+
+```elixir
+. . .
+  def handle_demand(demand, state) when demand > 0 do
+. . .
+```
+
+And now we will only handle a demand if there is actually work to be done.
+
+## Finalizing the Implementation
+
 [Here](https://github.com/ybur-yug/genstage_example/tree/87c5f96c74e8fa90cd5b5fd108cd9ba104f78a65) is a link to all code thus far.
 
